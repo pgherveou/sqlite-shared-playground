@@ -15,11 +15,11 @@ fn duplicate_registration_cannot_replace_a_handler() {
 fn invalid_requests_leave_the_database_unchanged() {
     let registry = registry().unwrap();
     let mut db = Db::memory().unwrap();
-    let request = postcard::to_allocvec(&CreatePurse {
+    let request = CreatePurse {
         name: "must not be inserted".into(),
         tag: PurseTag(vec![1]),
-    })
-    .unwrap();
+    }
+    .encode();
     assert!(matches!(
         registry.dispatch("missing.v1", &request, &mut db),
         Err(Error::Protocol(_))
@@ -38,19 +38,12 @@ fn invalid_requests_leave_the_database_unchanged() {
 }
 
 #[test]
-fn dispatch_uses_the_registered_output_type() {
+fn dispatch_accepts_scale_input_and_encodes_the_typed_output() {
     let registry = registry().unwrap();
     let mut db = Db::memory().unwrap();
-    let request = postcard::to_allocvec(&CreatePurse {
-        name: "Savings".into(),
-        tag: PurseTag(vec![255, 0]),
-    })
-    .unwrap();
+    let request = [28, b'S', b'a', b'v', b'i', b'n', b'g', b's', 8, 255, 0];
     let response = registry
         .dispatch(CreatePurse::NAME, &request, &mut db)
         .unwrap();
-    assert_eq!(
-        postcard::from_bytes::<Option<PurseId>>(&response).unwrap(),
-        Some(PurseId(0))
-    );
+    assert_eq!(response, vec![1, 0, 0, 0, 0]);
 }

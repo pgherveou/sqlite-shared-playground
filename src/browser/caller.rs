@@ -2,7 +2,7 @@ use core::cell::{Cell, RefCell};
 use std::{collections::HashMap, rc::Rc};
 
 use futures_channel::oneshot;
-use serde::{Serialize, de::DeserializeOwned};
+use parity_scale_codec::{Decode, DecodeAll, Encode};
 use wasm_bindgen::{JsCast, closure::Closure};
 use web_sys::{ErrorEvent, Event, MessageEvent, Worker};
 
@@ -89,7 +89,7 @@ impl State {
             version: VERSION,
             id,
             command,
-        })?;
+        });
         self.worker
             .post_message(&message)
             .map_err(|error| Error::Transport(wire::js_error(error)))
@@ -195,13 +195,12 @@ impl Backend {
         operation: OperationType,
     ) -> Result<OperationType::Output, Error>
     where
-        OperationType: Operation + Serialize,
-        OperationType::Output: DeserializeOwned,
+        OperationType: Operation + Encode,
+        OperationType::Output: Decode,
     {
-        let input = postcard::to_allocvec(&operation)
-            .map_err(|error| Error::Protocol(error.to_string()))?;
+        let input = operation.encode();
         let output = self.request(OperationType::NAME, input).await?;
-        postcard::from_bytes(&output).map_err(|error| {
+        OperationType::Output::decode_all(&mut output.as_slice()).map_err(|error| {
             Error::OutcomeUnknown(format!("operation result could not be decoded: {error}"))
         })
     }

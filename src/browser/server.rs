@@ -43,8 +43,7 @@ impl Listener {
             version: VERSION,
             id,
             result,
-        })
-        .map_err(js_error)?;
+        });
         self.scope.post_message(&message)
     }
 }

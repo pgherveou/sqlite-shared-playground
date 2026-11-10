@@ -1,14 +1,19 @@
 use wasm_bindgen::prelude::*;
 use web_sys::{Worker, WorkerOptions, WorkerType};
 
-use crate::{Client, HeldQuery, PurseId, PurseTag, SqlFailure};
+use crate::{Client, HeldQuery, PurseId, PurseRecord, PurseTag, SqlFailure};
 
 fn message(error: impl core::fmt::Display) -> JsValue {
     JsValue::from_str(&error.to_string())
 }
 
-fn value(output: impl serde::Serialize) -> Result<JsValue, JsValue> {
-    serde_wasm_bindgen::to_value(&output).map_err(message)
+fn purse_value(purse: PurseRecord) -> Result<JsValue, JsValue> {
+    let value = js_sys::Object::new();
+    js_sys::Reflect::set(&value, &"id".into(), &purse.id.0.into())?;
+    js_sys::Reflect::set(&value, &"name".into(), &purse.name.into())?;
+    let tag = js_sys::Array::from_iter(purse.tag.0.into_iter().map(JsValue::from));
+    js_sys::Reflect::set(&value, &"tag".into(), &tag)?;
+    Ok(value.into())
 }
 
 /// A Rust caller whose database lives in a different worker and WASM instance.
@@ -29,39 +34,47 @@ impl BrowserClient {
     }
 
     /// Creates a purse using the shared Rust operation.
-    pub async fn create_purse(&self, name: String, tag: Vec<u8>) -> Result<JsValue, JsValue> {
-        value(
-            self.client
-                .create_purse(name, PurseTag(tag))
-                .await
-                .map_err(message)?,
-        )
+    pub async fn create_purse(&self, name: String, tag: Vec<u8>) -> Result<Option<u32>, JsValue> {
+        self.client
+            .create_purse(name, PurseTag(tag))
+            .await
+            .map(|id| id.map(|id| id.0))
+            .map_err(message)
     }
 
     /// Looks up a purse through the registered worker handler.
     pub async fn purse(&self, id: u32) -> Result<JsValue, JsValue> {
-        value(self.client.purse(PurseId(id)).await.map_err(message)?)
+        match self.client.purse(PurseId(id)).await.map_err(message)? {
+            Some(purse) => purse_value(purse),
+            None => Ok(JsValue::UNDEFINED),
+        }
     }
 
     /// Lists matching purses through the same facade used by the native example.
-    pub async fn purses_tagged(&self, tag: Vec<u8>) -> Result<JsValue, JsValue> {
-        value(
-            self.client
-                .purses_tagged(PurseTag(tag))
-                .await
-                .map_err(message)?,
-        )
+    pub async fn purses_tagged(&self, tag: Vec<u8>) -> Result<js_sys::Array, JsValue> {
+        self.client
+            .purses_tagged(PurseTag(tag))
+            .await
+            .map_err(message)?
+            .into_iter()
+            .map(purse_value)
+            .collect()
     }
 
     /// Creates a complete batch atomically.
-    pub async fn create_purses(&self, names: JsValue, tag: Vec<u8>) -> Result<JsValue, JsValue> {
-        let names = serde_wasm_bindgen::from_value(names).map_err(message)?;
-        value(
-            self.client
-                .create_purses(names, PurseTag(tag))
-                .await
-                .map_err(message)?,
-        )
+    pub async fn create_purses(
+        &self,
+        names: Vec<String>,
+        tag: Vec<u8>,
+    ) -> Result<js_sys::Array, JsValue> {
+        let ids = self
+            .client
+            .create_purses(names, PurseTag(tag))
+            .await
+            .map_err(message)?;
+        Ok(js_sys::Array::from_iter(
+            ids.into_iter().map(|id| JsValue::from(id.0)),
+        ))
     }
 
     /// Demonstrates propagation of an SQLite error without closing the connection.

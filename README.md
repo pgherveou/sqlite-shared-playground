@@ -5,6 +5,7 @@ and in a dedicated browser database worker. There is no `async-sqlite` dependenc
 This is an execution-model proof, not a drop-in replacement for that crate.
 The native demo and async tests use Tokio 1, matching host-rust-core. SQLite runs
 on its dedicated connection threads; browser tasks use `wasm-bindgen-futures`.
+Worker requests, results and errors use SCALE (`parity-scale-codec` 3).
 
 ```text
 Native Rust CLI                 Browser page
@@ -59,7 +60,7 @@ let name = client.purse(PurseId(id)).await?.map(|purse| purse.name);
 The operation's arguments and implementation are declared once:
 
 ```rust
-#[derive(Serialize, Deserialize)]
+#[derive(Encode, Decode)]
 pub struct ReadPurse {
     pub id: PurseId,
 }
@@ -84,8 +85,8 @@ impl Operation for ReadPurse {
 `Client::purse(id)` calls `Client::call(ReadPurse { id })`. Native dispatch sends
 that value to a reader thread and invokes `execute` directly, without
 serialization. Browser dispatch sends the operation name and encoded arguments;
-the database worker decodes them and invokes the same implementation. Only the
-final result crosses back. Worker startup registers the handler explicitly:
+the database worker decodes them with SCALE and invokes the same implementation.
+Only the final result crosses back. Worker startup registers the handler explicitly:
 
 ```rust
 registry.register::<ReadPurse>()?;
@@ -93,6 +94,8 @@ registry.register::<ReadPurse>()?;
 
 On WASM, construction is `Client::connect(worker).await`; the domain methods are
 identical. There is no native registry lookup or serialization requirement.
+Decoders reject trailing bytes. The envelope version and explicit enum indexes
+define the wire format; caller and database worker must use compatible builds.
 
 | | async-sqlite closure API | This playground |
 | --- | --- | --- |

@@ -83,12 +83,12 @@ impl Client {
 
     /// Sends a registered operation to the database worker.
     #[cfg(target_arch = "wasm32")]
-    pub async fn call<Work: Operation + serde::Serialize>(
+    pub async fn call<Work: Operation + parity_scale_codec::Encode>(
         &self,
         work: Work,
     ) -> Result<Work::Output, Error>
     where
-        Work::Output: serde::de::DeserializeOwned,
+        Work::Output: parity_scale_codec::Decode,
     {
         self.backend.call(work).await
     }

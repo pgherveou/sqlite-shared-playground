@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, btree_map::Entry};
 
-use serde::{Serialize, de::DeserializeOwned};
+use parity_scale_codec::{Decode, DecodeAll, Encode};
 
 use crate::{
     CreatePurse, CreatePurses, Db, Error, HeldQuery, Operation, PursesTagged, ReadPurse, SqlFailure,
@@ -24,8 +24,8 @@ impl Registry {
     /// Adds a handler, rejecting ambiguous protocol names.
     pub fn register<Work>(&mut self) -> Result<(), Error>
     where
-        Work: Operation + DeserializeOwned,
-        Work::Output: Serialize,
+        Work: Operation + Decode,
+        Work::Output: Encode,
     {
         match self.handlers.entry(Work::NAME) {
             Entry::Vacant(entry) => {
@@ -49,20 +49,14 @@ impl Registry {
     }
 }
 
-fn execute<Work>(payload: &[u8], db: &mut Db) -> Result<Vec<u8>, Error>
+fn execute<Work>(mut payload: &[u8], db: &mut Db) -> Result<Vec<u8>, Error>
 where
-    Work: Operation + DeserializeOwned,
-    Work::Output: Serialize,
+    Work: Operation + Decode,
+    Work::Output: Encode,
 {
-    let (work, remaining) = postcard::take_from_bytes::<Work>(payload)
+    let work = Work::decode_all(&mut payload)
         .map_err(|error| Error::Protocol(format!("invalid operation payload: {error}")))?;
-    if !remaining.is_empty() {
-        return Err(Error::Protocol("trailing operation payload".into()));
-    }
-    let output = work.execute(db)?;
-    postcard::to_allocvec(&output).map_err(|error| {
-        Error::OutcomeUnknown(format!("result encoding failed after execution: {error}"))
-    })
+    Ok(work.execute(db)?.encode())
 }
 
 /// Registers the purse domain and the proof's diagnostic operations.

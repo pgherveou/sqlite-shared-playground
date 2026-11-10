@@ -1,5 +1,5 @@
+use parity_scale_codec::{Decode, Encode};
 use rusqlite::{OptionalExtension, Row, Transaction, named_params};
-use serde::{Deserialize, Serialize};
 
 use crate::{Db, Error, PurseId, PurseRecord, PurseTag};
 
@@ -24,7 +24,7 @@ pub trait Operation {
 }
 
 /// Reads one purse by identifier.
-#[derive(Serialize, Deserialize)]
+#[derive(Encode, Decode)]
 pub struct ReadPurse {
     /// Identifier to look up.
     pub id: PurseId,
@@ -47,7 +47,7 @@ impl Operation for ReadPurse {
 }
 
 /// Allocates one purse in a transaction.
-#[derive(Serialize, Deserialize)]
+#[derive(Encode, Decode)]
 pub struct CreatePurse {
     /// Display name.
     pub name: String,
@@ -65,7 +65,7 @@ impl Operation for CreatePurse {
 }
 
 /// Lists purses with matching opaque metadata.
-#[derive(Serialize, Deserialize)]
+#[derive(Encode, Decode)]
 pub struct PursesTagged {
     /// Exact tag to match.
     pub tag: PurseTag,
@@ -88,7 +88,7 @@ impl Operation for PursesTagged {
 }
 
 /// Creates a batch atomically; an empty name refuses the entire batch.
-#[derive(Serialize, Deserialize)]
+#[derive(Encode, Decode)]
 pub struct CreatePurses {
     /// Names processed in order in one transaction.
     pub names: Vec<String>,
@@ -142,7 +142,7 @@ fn purse_record(row: &Row<'_>) -> rusqlite::Result<PurseRecord> {
 }
 
 /// Exercises an SQL failure without invalidating subsequent operations.
-#[derive(Serialize, Deserialize)]
+#[derive(Encode, Decode)]
 pub struct SqlFailure;
 
 impl Operation for SqlFailure {
@@ -158,7 +158,7 @@ impl Operation for SqlFailure {
 }
 
 /// Holds SQLite inside a test-server gate to prove worker isolation.
-#[derive(Serialize, Deserialize)]
+#[derive(Encode, Decode)]
 pub struct HeldQuery;
 
 impl Operation for HeldQuery {
