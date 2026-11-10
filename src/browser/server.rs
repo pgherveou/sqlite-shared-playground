@@ -1,24 +1,10 @@
 use futures_channel::mpsc;
 use futures_util::StreamExt;
-use rusqlite::functions::FunctionFlags;
 use wasm_bindgen::{JsCast, prelude::*};
 use web_sys::{DedicatedWorkerGlobalScope, MessageEvent};
 
 use super::wire::{self, Command, Reply, Request, VERSION};
-use crate::{Db, Error, registry::registry};
-
-#[wasm_bindgen(inline_js = "
-export function waitForRelease() {
-    const request = new XMLHttpRequest();
-    request.open('GET', '/query-gate', false);
-    request.send();
-    if (request.status !== 200) throw new Error('query gate failed');
-}
-")]
-extern "C" {
-    #[wasm_bindgen(catch, js_name = waitForRelease)]
-    fn wait_for_release() -> Result<(), JsValue>;
-}
+use crate::{Db, Error, registry::Registry};
 
 struct Listener {
     scope: DedicatedWorkerGlobalScope,
@@ -62,52 +48,40 @@ fn js_error(error: impl core::fmt::Display) -> JsValue {
 ///
 /// The entry script must buffer messages while loading WASM, then replay them
 /// after invoking this function. Closing acknowledges SQLite and VFS cleanup.
-#[wasm_bindgen]
-pub fn serve_database(name: String) -> Result<js_sys::Promise, JsValue> {
+pub fn serve_database(
+    name: String,
+    registry: Registry,
+    initialize: fn(&mut Db) -> Result<(), Error>,
+) -> Result<js_sys::Promise, JsValue> {
     let (sender, receiver) = mpsc::unbounded();
     let listener = Listener::attach(sender)?;
     Ok(wasm_bindgen_futures::future_to_promise(async move {
-        serve(name, receiver, listener).await?;
+        serve(name, registry, initialize, receiver, listener).await?;
         Ok(JsValue::UNDEFINED)
     }))
 }
 
 async fn serve(
     name: String,
+    registry: Registry,
+    initialize: fn(&mut Db) -> Result<(), Error>,
     mut receiver: mpsc::UnboundedReceiver<JsValue>,
     listener: Listener,
 ) -> Result<(), JsValue> {
     use sqlite_wasm_vfs::sahpool::{OpfsSAHPoolCfg, install};
 
     let initialized = async {
-        let registry = registry()?;
         let pool = install::<sqlite_wasm_rs::WasmOsCallback>(&OpfsSAHPoolCfg::default(), true)
             .await
             .map_err(|error| Error::Transport(error.to_string()))?;
-        let db = match Db::open(name) {
+        let mut db = match Db::open(name) {
             Ok(db) => db,
             Err(error) => {
                 let _ = pool.pause();
                 return Err(error);
             }
         };
-        let configured = db.read(|connection| {
-            connection.create_scalar_function(
-                "wait_for_release",
-                0,
-                FunctionFlags::SQLITE_UTF8,
-                |_| {
-                    wait_for_release().map_err(|error| {
-                        rusqlite::Error::UserFunctionError(Box::new(std::io::Error::other(
-                            wire::js_error(error),
-                        )))
-                    })?;
-                    Ok(0_i64)
-                },
-            )?;
-            Ok(())
-        });
-        if let Err(error) = configured {
+        if let Err(error) = initialize(&mut db) {
             let _ = db.close();
             let _ = pool.pause();
             return Err(error);

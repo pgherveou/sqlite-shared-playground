@@ -53,7 +53,11 @@ pub struct Backend {
 
 impl Backend {
     /// Initializes the writer before opening any read-only connections.
-    pub async fn open(path: impl AsRef<Path>, readers: usize) -> Result<Self, Error> {
+    pub async fn open(
+        path: impl AsRef<Path>,
+        readers: usize,
+        initialize: fn(&mut Db) -> Result<(), Error>,
+    ) -> Result<Self, Error> {
         let path = path.as_ref().to_owned();
         if readers > 0 && (path == Path::new(":memory:") || path.as_os_str().is_empty()) {
             return Err(Error::Refused(
@@ -62,7 +66,8 @@ impl Backend {
         }
         let writer_path = path.clone();
         let writer = open_connection("sqlite-writer".into(), move || {
-            let db = Db::open(writer_path)?;
+            let mut db = Db::open(writer_path)?;
+            initialize(&mut db)?;
             if readers > 0 {
                 db.read(|connection| {
                     let mode: String =

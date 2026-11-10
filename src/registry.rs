@@ -2,9 +2,7 @@ use std::collections::{BTreeMap, btree_map::Entry};
 
 use parity_scale_codec::{Decode, DecodeAll, Encode};
 
-use crate::{
-    CreatePurse, CreatePurses, Db, Error, HeldQuery, Operation, PursesTagged, ReadPurse, SqlFailure,
-};
+use crate::{Db, Error, Operation};
 
 type Handler = fn(&[u8], &mut Db) -> Result<Vec<u8>, Error>;
 
@@ -57,18 +55,6 @@ where
     let work = Work::decode_all(&mut payload)
         .map_err(|error| Error::Protocol(format!("invalid operation payload: {error}")))?;
     Ok(work.execute(db)?.encode())
-}
-
-/// Registers the purse domain and the proof's diagnostic operations.
-pub fn registry() -> Result<Registry, Error> {
-    let mut registry = Registry::new();
-    registry.register::<ReadPurse>()?;
-    registry.register::<CreatePurse>()?;
-    registry.register::<PursesTagged>()?;
-    registry.register::<CreatePurses>()?;
-    registry.register::<SqlFailure>()?;
-    registry.register::<HeldQuery>()?;
-    Ok(registry)
 }
 
 #[cfg(test)]

@@ -5,7 +5,8 @@ use std::sync::mpsc;
 use futures_channel::oneshot;
 use futures_util::{FutureExt, future::join_all};
 use sqlite_shared_playground::{
-    Access, Client, Db, Error, Operation, PurseId, PurseRecord, PurseTag,
+    Access, Client, Db, Error, Operation, PurseDao, PurseId, PurseRecord, PurseTag,
+    initialize_database,
 };
 
 fn tag() -> PurseTag {
@@ -15,19 +16,16 @@ fn tag() -> PurseTag {
 #[tokio::test]
 async fn concurrent_creates_keep_each_name_and_allocate_distinct_ids() {
     let directory = tempfile::tempdir().unwrap();
-    let client = Client::open(directory.path().join("purses.sqlite3"))
+    let client = Client::open(directory.path().join("purses.sqlite3"), initialize_database)
         .await
         .unwrap();
+    let purses = PurseDao::new(client.clone());
     let names: Vec<_> = (0..32).map(|index| format!("purse-{index}")).collect();
-    let created = join_all(
-        names
-            .iter()
-            .map(|name| client.create_purse(name.clone(), tag())),
-    )
-    .await
-    .into_iter()
-    .collect::<Result<Vec<_>, _>>()
-    .unwrap();
+    let created = join_all(names.iter().map(|name| purses.create(name.clone(), tag())))
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
     let expected: Vec<_> = names
         .into_iter()
         .zip(created)
@@ -37,7 +35,7 @@ async fn concurrent_creates_keep_each_name_and_allocate_distinct_ids() {
             tag: tag(),
         })
         .collect();
-    assert_eq!(client.purses_tagged(tag()).await.unwrap(), expected);
+    assert_eq!(purses.tagged(tag()).await.unwrap(), expected);
     let ids: Vec<_> = expected.iter().map(|record| record.id).collect();
     assert_eq!(ids, (0..32).map(PurseId).collect::<Vec<_>>());
     client.close().await.unwrap();
@@ -46,17 +44,18 @@ async fn concurrent_creates_keep_each_name_and_allocate_distinct_ids() {
 #[tokio::test]
 async fn refusing_a_later_batch_item_rolls_back_earlier_inserts() {
     let directory = tempfile::tempdir().unwrap();
-    let client = Client::open(directory.path().join("purses.sqlite3"))
+    let client = Client::open(directory.path().join("purses.sqlite3"), initialize_database)
         .await
         .unwrap();
-    let result = client
-        .create_purses(vec!["should roll back".into(), String::new()], tag())
+    let purses = PurseDao::new(client.clone());
+    let result = purses
+        .create_batch(vec!["should roll back".into(), String::new()], tag())
         .await;
     assert!(matches!(result, Err(Error::Refused(_))));
-    assert_eq!(client.purses_tagged(tag()).await.unwrap(), Vec::new());
+    assert_eq!(purses.tagged(tag()).await.unwrap(), Vec::new());
     assert_eq!(
-        client
-            .create_purse("first committed".into(), tag())
+        purses
+            .create("first committed".into(), tag())
             .await
             .unwrap(),
         Some(PurseId(0))
@@ -68,16 +67,18 @@ async fn refusing_a_later_batch_item_rolls_back_earlier_inserts() {
 async fn committed_purses_survive_connection_replacement() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("purses.sqlite3");
-    let client = Client::open(&path).await.unwrap();
-    let id = client
-        .create_purse("persistent".into(), tag())
+    let client = Client::open(&path, initialize_database).await.unwrap();
+    let purses = PurseDao::new(client.clone());
+    let id = purses
+        .create("persistent".into(), tag())
         .await
         .unwrap()
         .unwrap();
     client.close().await.unwrap();
-    let reopened = Client::open(&path).await.unwrap();
+    let reopened = Client::open(&path, initialize_database).await.unwrap();
+    let reopened_purses = PurseDao::new(reopened.clone());
     assert_eq!(
-        reopened.purse(id).await.unwrap(),
+        reopened_purses.get(id).await.unwrap(),
         Some(PurseRecord {
             id,
             name: "persistent".into(),
@@ -101,18 +102,16 @@ impl Operation for BrokenQuery {
 #[tokio::test]
 async fn sql_error_does_not_poison_later_operations() {
     let directory = tempfile::tempdir().unwrap();
-    let client = Client::open(directory.path().join("purses.sqlite3"))
+    let client = Client::open(directory.path().join("purses.sqlite3"), initialize_database)
         .await
         .unwrap();
+    let purses = PurseDao::new(client.clone());
     assert!(matches!(
         client.call(BrokenQuery).await,
         Err(Error::Sqlite(_))
     ));
     assert_eq!(
-        client
-            .create_purse("after error".into(), tag())
-            .await
-            .unwrap(),
+        purses.create("after error".into(), tag()).await.unwrap(),
         Some(PurseId(0))
     );
     client.close().await.unwrap();
@@ -139,7 +138,8 @@ impl Operation for Gate {
 async fn close_drains_admitted_jobs_and_stops_new_admission() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("purses.sqlite3");
-    let client = Client::open(&path).await.unwrap();
+    let client = Client::open(&path, initialize_database).await.unwrap();
+    let purses = PurseDao::new(client.clone());
     let (entered, arrived) = oneshot::channel();
     let (release, wait) = mpsc::channel();
     let mut running = Box::pin(client.call(Gate {
@@ -149,22 +149,23 @@ async fn close_drains_admitted_jobs_and_stops_new_admission() {
     assert!(running.as_mut().now_or_never().is_none());
     assert_ne!(arrived.await.unwrap(), std::thread::current().id());
 
-    let mut create = Box::pin(client.create_purse("queued before close".into(), tag()));
+    let mut create = Box::pin(purses.create("queued before close".into(), tag()));
     assert!(create.as_mut().now_or_never().is_none());
     let mut close = Box::pin(client.close());
     assert!(close.as_mut().now_or_never().is_none());
     let mut another_close = Box::pin(client.close());
     assert!(another_close.as_mut().now_or_never().is_none());
-    assert_eq!(client.purse(PurseId(0)).await, Err(Error::Closed));
+    assert_eq!(purses.get(PurseId(0)).await, Err(Error::Closed));
 
     release.send(()).unwrap();
     running.await.unwrap();
     assert_eq!(create.await.unwrap(), Some(PurseId(0)));
     close.await.unwrap();
     another_close.await.unwrap();
-    let reopened = Client::open(&path).await.unwrap();
+    let reopened = Client::open(&path, initialize_database).await.unwrap();
+    let reopened_purses = PurseDao::new(reopened.clone());
     assert_eq!(
-        reopened.purse(PurseId(0)).await.unwrap(),
+        reopened_purses.get(PurseId(0)).await.unwrap(),
         Some(PurseRecord {
             id: PurseId(0),
             name: "queued before close".into(),
@@ -177,9 +178,14 @@ async fn close_drains_admitted_jobs_and_stops_new_admission() {
 #[tokio::test]
 async fn dropping_an_admitted_reply_does_not_retract_its_write() {
     let directory = tempfile::tempdir().unwrap();
-    let client = Client::open_with_readers(directory.path().join("purses.sqlite3"), 0)
-        .await
-        .unwrap();
+    let client = Client::open_with_readers(
+        directory.path().join("purses.sqlite3"),
+        0,
+        initialize_database,
+    )
+    .await
+    .unwrap();
+    let purses = PurseDao::new(client.clone());
     let (entered, arrived) = oneshot::channel();
     let (release, wait) = mpsc::channel();
     let mut running = Box::pin(client.call(Gate {
@@ -188,13 +194,13 @@ async fn dropping_an_admitted_reply_does_not_retract_its_write() {
     }));
     assert!(running.as_mut().now_or_never().is_none());
     arrived.await.unwrap();
-    let mut abandoned = Box::pin(client.create_purse("admitted".into(), tag()));
+    let mut abandoned = Box::pin(purses.create("admitted".into(), tag()));
     assert!(abandoned.as_mut().now_or_never().is_none());
     drop(abandoned);
     release.send(()).unwrap();
     running.await.unwrap();
     assert_eq!(
-        client.purses_tagged(tag()).await.unwrap(),
+        purses.tagged(tag()).await.unwrap(),
         vec![PurseRecord {
             id: PurseId(0),
             name: "admitted".into(),
@@ -222,7 +228,10 @@ impl Operation for PanicDuringWrite {
 async fn panic_rolls_back_the_write_and_settles_queued_calls() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("purses.sqlite3");
-    let client = Client::open_with_readers(&path, 0).await.unwrap();
+    let client = Client::open_with_readers(&path, 0, initialize_database)
+        .await
+        .unwrap();
+    let purses = PurseDao::new(client.clone());
     let (entered, arrived) = oneshot::channel();
     let (release, wait) = mpsc::channel();
     let mut running = Box::pin(client.call(Gate {
@@ -233,14 +242,17 @@ async fn panic_rolls_back_the_write_and_settles_queued_calls() {
     arrived.await.unwrap();
     let mut failing = Box::pin(client.call(PanicDuringWrite));
     assert!(failing.as_mut().now_or_never().is_none());
-    let mut queued = Box::pin(client.purse(PurseId(0)));
+    let mut queued = Box::pin(purses.get(PurseId(0)));
     assert!(queued.as_mut().now_or_never().is_none());
     release.send(()).unwrap();
     running.await.unwrap();
     assert!(matches!(failing.await, Err(Error::OutcomeUnknown(_))));
     assert!(matches!(queued.await, Err(Error::OutcomeUnknown(_))));
-    let reopened = Client::open_with_readers(&path, 0).await.unwrap();
-    assert_eq!(reopened.purse(PurseId(0)).await.unwrap(), None);
+    let reopened = Client::open_with_readers(&path, 0, initialize_database)
+        .await
+        .unwrap();
+    let reopened_purses = PurseDao::new(reopened.clone());
+    assert_eq!(reopened_purses.get(PurseId(0)).await.unwrap(), None);
     reopened.close().await.unwrap();
 }
 
@@ -298,11 +310,12 @@ impl Operation for RenameWhileHeld {
 #[tokio::test]
 async fn readers_see_committed_state_while_the_writer_is_in_a_transaction() {
     let directory = tempfile::tempdir().unwrap();
-    let client = Client::open(directory.path().join("purses.sqlite3"))
+    let client = Client::open(directory.path().join("purses.sqlite3"), initialize_database)
         .await
         .unwrap();
-    let id = client
-        .create_purse("before".into(), tag())
+    let purses = PurseDao::new(client.clone());
+    let id = purses
+        .create("before".into(), tag())
         .await
         .unwrap()
         .unwrap();
@@ -310,10 +323,10 @@ async fn readers_see_committed_state_while_the_writer_is_in_a_transaction() {
     let mut write = Box::pin(client.call(RenameWhileHeld { id, gate }));
     assert!(write.as_mut().now_or_never().is_none());
     finish(arrived).await.unwrap();
-    let before = finish(client.purse(id)).await.unwrap();
+    let before = finish(purses.get(id)).await.unwrap();
     drop(release);
     write.await.unwrap();
-    let after = client.purse(id).await.unwrap();
+    let after = purses.get(id).await.unwrap();
     assert_eq!(
         (before, after),
         (
@@ -359,9 +372,13 @@ impl Operation for ReaderThread {
 #[tokio::test]
 async fn two_readers_execute_independently_and_rotate_across_calls() {
     let directory = tempfile::tempdir().unwrap();
-    let client = Client::open_with_readers(directory.path().join("purses.sqlite3"), 2)
-        .await
-        .unwrap();
+    let client = Client::open_with_readers(
+        directory.path().join("purses.sqlite3"),
+        2,
+        initialize_database,
+    )
+    .await
+    .unwrap();
     let (first_gate, first_arrived, first_release) = gate();
     let (second_gate, second_arrived, second_release) = gate();
     let mut first = Box::pin(client.call(ReadGate(first_gate)));
@@ -403,16 +420,21 @@ impl Operation for MisclassifiedWrite {
 #[tokio::test]
 async fn read_operations_cannot_write_and_the_reader_remains_usable() {
     let directory = tempfile::tempdir().unwrap();
-    let client = Client::open_with_readers(directory.path().join("purses.sqlite3"), 1)
-        .await
-        .unwrap();
+    let client = Client::open_with_readers(
+        directory.path().join("purses.sqlite3"),
+        1,
+        initialize_database,
+    )
+    .await
+    .unwrap();
+    let purses = PurseDao::new(client.clone());
     assert!(matches!(
         client.call(MisclassifiedWrite).await,
         Err(Error::Sqlite(_))
     ));
-    assert_eq!(client.purse(PurseId(0)).await.unwrap(), None);
+    assert_eq!(purses.get(PurseId(0)).await.unwrap(), None);
     assert_eq!(
-        client.create_purse("allowed".into(), tag()).await.unwrap(),
+        purses.create("allowed".into(), tag()).await.unwrap(),
         Some(PurseId(0))
     );
     client.close().await.unwrap();
@@ -421,9 +443,14 @@ async fn read_operations_cannot_write_and_the_reader_remains_usable() {
 #[tokio::test]
 async fn pool_close_waits_for_both_readers_and_the_writer() {
     let directory = tempfile::tempdir().unwrap();
-    let client = Client::open_with_readers(directory.path().join("purses.sqlite3"), 2)
-        .await
-        .unwrap();
+    let client = Client::open_with_readers(
+        directory.path().join("purses.sqlite3"),
+        2,
+        initialize_database,
+    )
+    .await
+    .unwrap();
+    let purses = PurseDao::new(client.clone());
     let (writer_gate, writer_arrived, writer_release) = gate();
     let (first_gate, first_arrived, first_release) = gate();
     let (second_gate, second_arrived, second_release) = gate();
@@ -438,9 +465,9 @@ async fn pool_close_waits_for_both_readers_and_the_writer() {
     finish(second_arrived).await.unwrap();
     let mut close = Box::pin(client.close());
     assert!(close.as_mut().now_or_never().is_none());
-    assert_eq!(client.purse(PurseId(0)).await, Err(Error::Closed));
+    assert_eq!(purses.get(PurseId(0)).await, Err(Error::Closed));
     assert_eq!(
-        client.create_purse("rejected".into(), tag()).await,
+        purses.create("rejected".into(), tag()).await,
         Err(Error::Closed)
     );
     drop(writer_release);
@@ -456,15 +483,20 @@ async fn pool_close_waits_for_both_readers_and_the_writer() {
 
 #[tokio::test]
 async fn private_memory_uses_one_connection_and_rejects_independent_readers() {
-    assert!(Client::open_with_readers(":memory:", 2).await.is_err());
-    let client = Client::open(":memory:").await.unwrap();
-    let id = client
-        .create_purse("memory".into(), tag())
+    assert!(
+        Client::open_with_readers(":memory:", 2, initialize_database)
+            .await
+            .is_err()
+    );
+    let client = Client::open(":memory:", initialize_database).await.unwrap();
+    let purses = PurseDao::new(client.clone());
+    let id = purses
+        .create("memory".into(), tag())
         .await
         .unwrap()
         .unwrap();
     assert_eq!(
-        client.purse(id).await.unwrap(),
+        purses.get(id).await.unwrap(),
         Some(PurseRecord {
             id,
             name: "memory".into(),
@@ -472,4 +504,57 @@ async fn private_memory_uses_one_connection_and_rejects_independent_readers() {
         })
     );
     client.close().await.unwrap();
+}
+
+struct ReadStartupValue;
+
+impl Operation for ReadStartupValue {
+    const NAME: &'static str = "test.startup-value.v1";
+    const ACCESS: Access = Access::Read;
+    type Output = String;
+
+    fn execute(self, db: &mut Db) -> Result<Self::Output, Error> {
+        db.read(|connection| {
+            Ok(connection.query_row("SELECT value FROM startup", [], |row| row.get(0))?)
+        })
+    }
+}
+
+#[tokio::test]
+async fn custom_schema_is_ready_before_readers_accept_work() {
+    let directory = tempfile::tempdir().unwrap();
+    let client = Client::open(directory.path().join("custom.sqlite3"), |db| {
+        db.write(|transaction| {
+            transaction.execute_batch(
+                "CREATE TABLE startup (value TEXT NOT NULL);
+                 INSERT INTO startup VALUES ('ready');",
+            )?;
+            Ok(())
+        })
+    })
+    .await
+    .unwrap();
+    assert_eq!(client.call(ReadStartupValue).await.unwrap(), "ready");
+    client.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn initializer_failure_prevents_a_client_from_becoming_ready() {
+    let result = Client::open(":memory:", |_| Err(Error::Refused("schema failed".into()))).await;
+    assert_eq!(result.err(), Some(Error::Refused("schema failed".into())));
+}
+
+#[test]
+fn bare_connection_does_not_install_application_tables() {
+    let db = Db::memory().unwrap();
+    let tables: Vec<String> = db
+        .read(|connection| {
+            let mut statement =
+                connection.prepare("SELECT name FROM sqlite_schema WHERE type = 'table'")?;
+            Ok(statement
+                .query_map([], |row| row.get(0))?
+                .collect::<Result<_, _>>()?)
+        })
+        .unwrap();
+    assert_eq!(tables, Vec::<String>::new());
 }

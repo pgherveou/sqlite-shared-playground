@@ -1,7 +1,11 @@
 use wasm_bindgen::prelude::*;
 use web_sys::{Worker, WorkerOptions, WorkerType};
 
-use crate::{Client, HeldQuery, PurseId, PurseRecord, PurseTag, SqlFailure};
+use crate::{
+    Client, PurseDao, PurseId, PurseRecord, PurseTag, initialize_database,
+    proof::{HeldQuery, SqlFailure},
+    startup,
+};
 
 fn message(error: impl core::fmt::Display) -> JsValue {
     JsValue::from_str(&error.to_string())
@@ -20,6 +24,7 @@ fn purse_value(purse: PurseRecord) -> Result<JsValue, JsValue> {
 #[wasm_bindgen]
 pub struct BrowserClient {
     client: Client,
+    purses: PurseDao,
 }
 
 #[wasm_bindgen]
@@ -30,13 +35,14 @@ impl BrowserClient {
         options.set_type(WorkerType::Module);
         let worker = Worker::new_with_options(&url, &options)?;
         let client = Client::connect(worker).await.map_err(message)?;
-        Ok(Self { client })
+        let purses = PurseDao::new(client.clone());
+        Ok(Self { client, purses })
     }
 
     /// Creates a purse using the shared Rust operation.
     pub async fn create_purse(&self, name: String, tag: Vec<u8>) -> Result<Option<u32>, JsValue> {
-        self.client
-            .create_purse(name, PurseTag(tag))
+        self.purses
+            .create(name, PurseTag(tag))
             .await
             .map(|id| id.map(|id| id.0))
             .map_err(message)
@@ -44,7 +50,7 @@ impl BrowserClient {
 
     /// Looks up a purse through the registered worker handler.
     pub async fn purse(&self, id: u32) -> Result<JsValue, JsValue> {
-        match self.client.purse(PurseId(id)).await.map_err(message)? {
+        match self.purses.get(PurseId(id)).await.map_err(message)? {
             Some(purse) => purse_value(purse),
             None => Ok(JsValue::UNDEFINED),
         }
@@ -52,8 +58,8 @@ impl BrowserClient {
 
     /// Lists matching purses through the same facade used by the native example.
     pub async fn purses_tagged(&self, tag: Vec<u8>) -> Result<js_sys::Array, JsValue> {
-        self.client
-            .purses_tagged(PurseTag(tag))
+        self.purses
+            .tagged(PurseTag(tag))
             .await
             .map_err(message)?
             .into_iter()
@@ -68,8 +74,8 @@ impl BrowserClient {
         tag: Vec<u8>,
     ) -> Result<js_sys::Array, JsValue> {
         let ids = self
-            .client
-            .create_purses(names, PurseTag(tag))
+            .purses
+            .create_batch(names, PurseTag(tag))
             .await
             .map_err(message)?;
         Ok(js_sys::Array::from_iter(
@@ -116,4 +122,17 @@ impl BrowserClient {
 #[wasm_bindgen]
 pub fn ping() -> String {
     "Rust caller responsive".into()
+}
+
+/// Opens the playground's domains and serves them on a dedicated database worker.
+///
+/// The entry script must buffer messages while loading WASM and replay them
+/// after calling this function.
+#[wasm_bindgen]
+pub fn serve_database(name: String) -> Result<js_sys::Promise, JsValue> {
+    crate::browser::serve_database(
+        name,
+        startup::registry().map_err(message)?,
+        initialize_database,
+    )
 }

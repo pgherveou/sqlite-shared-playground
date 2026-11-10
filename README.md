@@ -12,6 +12,8 @@ Native Rust CLI                 Browser page
       |                              |
       |                        Rust/WASM caller worker
       |                              |
+  PurseDao                       PurseDao
+      |                              |
    Client                         Client
       | typed job                    | encoded operation
       v                              v
@@ -53,8 +55,9 @@ closures. Making the call `async` does not remove this boundary.
 Here, the caller invokes a named operation through a typed facade:
 
 ```rust
-let client = Client::open("purses.sqlite3").await?; // native
-let name = client.purse(PurseId(id)).await?.map(|purse| purse.name);
+let client = Client::open("purses.sqlite3", initialize_database).await?; // native
+let purses = PurseDao::new(client.clone());
+let name = purses.get(PurseId(id)).await?.map(|purse| purse.name);
 ```
 
 The operation's arguments and implementation are declared once:
@@ -82,14 +85,16 @@ impl Operation for ReadPurse {
 }
 ```
 
-`Client::purse(id)` calls `Client::call(ReadPurse { id })`. Native dispatch sends
+`PurseDao::get(id)` calls `Client::call(ReadPurse { id })`. Native dispatch sends
 that value to a reader thread and invokes `execute` directly, without
 serialization. Browser dispatch sends the operation name and encoded arguments;
 the database worker decodes them with SCALE and invokes the same implementation.
-Only the final result crosses back. Worker startup registers the handler explicitly:
+Only the final result crosses back. `purse.rs` owns the DAO methods, types, SQL,
+schema and operation registration. `startup.rs` composes domain initialization and
+the worker catalog:
 
 ```rust
-registry.register::<ReadPurse>()?;
+purse::register(&mut registry)?;
 ```
 
 On WASM, construction is `Client::connect(worker).await`; the domain methods are
@@ -120,9 +125,9 @@ open with SQLite's read-only flag. Operations mixing reads and writes stay on th
 writer for their entire transaction.
 
 ```rust
-let client = Client::open("purses.sqlite3").await?; // one writer, two readers
+let client = Client::open("purses.sqlite3", initialize_database).await?; // two readers
 // Or choose the reader count; zero routes every operation to the writer.
-let client = Client::open_with_readers("other.sqlite3", 4).await?;
+let client = Client::open_with_readers("other.sqlite3", 4, initialize_database).await?;
 ```
 
 Readers can progress during a write and see committed data. There is no global
@@ -160,13 +165,15 @@ cargo +nightly fmt --check
 
 | File | Responsibility |
 | --- | --- |
-| `src/operation.rs` | Typed arguments, SQL, row decoding and shared operation bodies |
-| `src/lib.rs` | Async domain facade |
-| `src/db.rs` | Connection, schema and transaction wrapper |
+| `src/purse.rs` | Purse DAO, types, operations, SQL, schema and registration |
+| `src/lib.rs`, `src/operation.rs` | Generic client, operation trait and access routing declaration |
+| `src/startup.rs` | Domain schema and worker catalog composition |
+| `src/db.rs` | Connection and transaction wrapper |
 | `src/native.rs` | Access routing, writer and reader threads, shared shutdown |
 | `src/registry.rs` | Typed worker handlers, duplicate and unknown-name checks |
 | `src/browser/` | Worker transport, correlation and lifecycle |
 | `src/web_api.rs`, `web/` | Browser entry points and demo |
+| `src/proof.rs` | Diagnostic operations and the browser isolation gate |
 
 The purse queries, schema and domain types are adapted from `host-rust-core` at
 `4b58ce1db4c01e937ebbb1e00c40833b99e5bfe5`, specifically `nft/dao.rs`,

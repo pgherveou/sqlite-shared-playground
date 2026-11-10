@@ -10,7 +10,7 @@ pub struct Db {
 }
 
 impl Db {
-    /// Opens persistent storage and initializes the proof's purse schema.
+    /// Opens persistent storage with foreign-key enforcement enabled.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, Error> {
         Self::initialize(Connection::open(path)?)
     }
@@ -32,18 +32,6 @@ impl Db {
 
     fn initialize(connection: Connection) -> Result<Self, Error> {
         connection.pragma_update(None, "foreign_keys", true)?;
-        connection.execute_batch(
-            "BEGIN IMMEDIATE;
-             CREATE TABLE IF NOT EXISTS nft_purse (
-                 id INTEGER PRIMARY KEY CHECK (id BETWEEN 0 AND 4294967295),
-                 name TEXT NOT NULL,
-                 tag BLOB NOT NULL
-             );
-             CREATE INDEX IF NOT EXISTS nft_purse_tag ON nft_purse(tag);
-             INSERT OR IGNORE INTO nft_purse (id, name, tag)
-                 VALUES (4294967295, 'Main', x'');
-             COMMIT;",
-        )?;
         Ok(Self { connection })
     }
 
