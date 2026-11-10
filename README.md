@@ -2,6 +2,7 @@
 
 The same Rust purse DAO and operation handlers run on a native connection thread
 and in a dedicated browser database worker. There is no `async-sqlite` dependency.
+This is an execution-model proof, not a drop-in replacement for that crate.
 
 ```text
 Native Rust CLI                 Browser page
@@ -18,18 +19,85 @@ Connection thread               Database worker, separate WASM instance
                      DAO / rusqlite / SQLite
 ```
 
+## How it differs from async-sqlite
+
+[`async-sqlite`](https://github.com/ryanfowler/async-sqlite) sends a Rust closure
+to a connection-owning native thread. The closure can use ordinary `rusqlite`
+queries, transactions and captured application values. The following read assumes
+an existing purse table:
+
 ```rust
-let client = Client::open("purses.sqlite3").await?;
-let tag = PurseTag(vec![1, 2, 3]);
-let id = client.create_purse("Savings".into(), tag.clone()).await?;
-let purses = client.purses_tagged(tag).await?;
-client.close().await?;
+use rusqlite::OptionalExtension;
+
+let sqlite = async_sqlite::ClientBuilder::new()
+    .path("purses.sqlite3")
+    .open()
+    .await?;
+
+let name: Option<String> = sqlite.conn(move |conn| {
+    conn.query_row(
+        "SELECT name FROM nft_purse WHERE id = ?1",
+        [id],
+        |row| row.get(0),
+    ).optional()
+}).await?;
+```
+
+Native threads share memory, so they can receive that closure. A separate browser
+worker has its own WASM instance and cannot receive arbitrary captured Rust
+closures. Making the call `async` does not remove this boundary.
+
+Here, the caller invokes a named operation through a typed facade:
+
+```rust
+let client = Client::open("purses.sqlite3").await?; // native
+let name = client.purse(PurseId(id)).await?.map(|purse| purse.name);
+```
+
+The operation's arguments and implementation are declared once:
+
+```rust
+#[derive(Serialize, Deserialize)]
+pub struct ReadPurse {
+    pub id: PurseId,
+}
+
+impl Operation for ReadPurse {
+    const NAME: &'static str = "nft.purse.v1";
+    type Output = Option<PurseRecord>;
+
+    fn execute(self, db: &mut Db) -> Result<Self::Output, Error> {
+        db.read(|conn| dao::purse(conn, self.id))
+    }
+}
+```
+
+`Client::purse(id)` calls `Client::call(ReadPurse { id })`. Native dispatch sends
+that value to the connection thread and invokes `execute` directly, without
+serialization. Browser dispatch sends the operation name and encoded arguments;
+the database worker decodes them and invokes the same implementation. Only the
+final result crosses back. Worker startup registers the handler explicitly:
+
+```rust
+registry.register::<ReadPurse>()?;
 ```
 
 On WASM, construction is `Client::connect(worker).await`; the domain methods are
-identical. Native dispatch has no serialization bounds. Browser startup explicitly
-registers each operation once. A handler may call several DAO functions in one
-transaction; neither statements nor transaction handles cross worker boundaries.
+identical. There is no native registry lookup or serialization requirement.
+
+| | async-sqlite closure API | This playground |
+| --- | --- | --- |
+| Unit of work | Arbitrary Rust closure | Named Rust operation |
+| Native execution | Connection thread | Connection thread |
+| Browser execution | Closure cannot cross independent WASM instances | Registered handler in a separate database worker |
+| SQLite access | Ordinary `rusqlite` inside the closure | Ordinary `rusqlite` inside the handler |
+| Application work | Write the closure at the call site | Declare an operation and register it for browser use |
+
+A handler can use cached statements, map rows, and compose several DAO functions
+inside one `Db::write` transaction. Transactions finish before the handler replies;
+there is no message per SQL statement or remote transaction handle. Application
+services captured by existing closures still need an explicit design if the
+operation depends on them. This proof covers data-only purse operations.
 
 ## Run
 
