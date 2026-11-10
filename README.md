@@ -174,8 +174,9 @@ proof-specific operation, not a rule added to the source DAO.
 
 Accepted operations continue if their waiting future is dropped. Close drains
 accepted work before releasing storage. Termination or a lost reply can leave a
-write's outcome unknown; the client never retries it automatically. Native panics
-stop the affected connection owner; there is no automatic replacement. Calls
+write's outcome unknown; the client never retries it automatically. An unwinding
+native panic exits the affected connection thread naturally and closes pending
+reply channels; there is no panic interception or automatic replacement. Calls
 selecting that owner fail until the client is reopened. Errors use a deliberately
 small serializable type; SQLite errors retain their message, not the full
 `rusqlite::Error` structure.

@@ -13,7 +13,7 @@ use futures_util::{
 
 use crate::{Access, Db, Error, Operation};
 
-type Job = Box<dyn FnOnce(&mut Db) -> bool + Send>;
+type Job = Box<dyn FnOnce(&mut Db) + Send>;
 type Completion = Shared<BoxFuture<'static, Result<(), Error>>>;
 
 enum Message {
@@ -106,21 +106,9 @@ impl Backend {
         Command::Output: Send + 'static,
     {
         let (reply, response) = oneshot::channel();
-        let job =
-            move |db: &mut Db| match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                operation.execute(db)
-            })) {
-                Ok(result) => {
-                    let _ = reply.send(result);
-                    true
-                }
-                Err(_) => {
-                    let _ = reply.send(Err(Error::OutcomeUnknown(
-                        "operation panicked; connection stopped".into(),
-                    )));
-                    false
-                }
-            };
+        let job = move |db: &mut Db| {
+            let _ = reply.send(operation.execute(db));
+        };
         {
             let mut state = self
                 .state
@@ -212,11 +200,7 @@ async fn open_connection(
 fn serve(mut db: Db, receiver: mpsc::Receiver<Message>) {
     while let Ok(message) = receiver.recv() {
         match message {
-            Message::Execute(job) => {
-                if !job(&mut db) {
-                    return;
-                }
-            }
+            Message::Execute(job) => job(&mut db),
             Message::Close(reply) => {
                 let _ = reply.send(db.close());
                 return;
