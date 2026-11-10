@@ -1,6 +1,6 @@
 # Shared SQLite playground
 
-The same Rust purse operations run on a native connection thread
+The same Rust purse operations run on native connection threads
 and in a dedicated browser database worker. There is no `async-sqlite` dependency.
 This is an execution-model proof, not a drop-in replacement for that crate.
 
@@ -12,7 +12,7 @@ Native Rust CLI                 Browser page
    Client                         Client
       | typed job                    | encoded operation
       v                              v
-Connection thread               Database worker, separate WASM instance
+Writer + reader threads         Database worker, separate WASM instance
       |                              | Registry
       +--------- Operation::execute(&mut Db)
                               |
@@ -64,6 +64,7 @@ pub struct ReadPurse {
 
 impl Operation for ReadPurse {
     const NAME: &'static str = "nft.purse.v1";
+    const ACCESS: Access = Access::Read;
     type Output = Option<PurseRecord>;
 
     fn execute(self, db: &mut Db) -> Result<Self::Output, Error> {
@@ -79,7 +80,7 @@ impl Operation for ReadPurse {
 ```
 
 `Client::purse(id)` calls `Client::call(ReadPurse { id })`. Native dispatch sends
-that value to the connection thread and invokes `execute` directly, without
+that value to a reader thread and invokes `execute` directly, without
 serialization. Browser dispatch sends the operation name and encoded arguments;
 the database worker decodes them and invokes the same implementation. Only the
 final result crosses back. Worker startup registers the handler explicitly:
@@ -94,7 +95,7 @@ identical. There is no native registry lookup or serialization requirement.
 | | async-sqlite closure API | This playground |
 | --- | --- | --- |
 | Unit of work | Arbitrary Rust closure | Named Rust operation |
-| Native execution | Connection thread | Connection thread |
+| Native execution | Connection thread, with optional pool | One writer and configurable read-only readers |
 | Browser execution | Closure cannot cross independent WASM instances | Registered handler in a separate database worker |
 | SQLite access | Ordinary `rusqlite` inside the closure | Ordinary `rusqlite` inside the handler |
 | Application work | Write the closure at the call site | Declare an operation and register it for browser use |
@@ -104,6 +105,28 @@ inside one `Db::write` transaction. Transactions finish before the handler repli
 there is no message per SQL statement or remote transaction handle. Application
 services captured by existing closures still need an explicit design if the
 operation depends on them. This proof covers data-only purse operations.
+
+## Native readers and writer
+
+Operations default to `Access::Write`. `ReadPurse` and `PursesTagged` declare
+`Access::Read`; native dispatch selects a reader round-robin. Each connection has
+its own thread. The writer initializes the schema and enables WAL before readers
+open with SQLite's read-only flag. Operations mixing reads and writes stay on the
+writer for their entire transaction.
+
+```rust
+let client = Client::open("purses.sqlite3").await?; // one writer, two readers
+// Or choose the reader count; zero routes every operation to the writer.
+let client = Client::open_with_readers("other.sqlite3", 4).await?;
+```
+
+Readers can progress during a write and see committed data. There is no global
+FIFO across connections: await a write before submitting a dependent read. Close
+stops admission to all connections and waits for their queued work. Private memory
+and temporary databases default to one connection and reject explicit readers.
+The browser uses the same operation definitions on its single database worker;
+`Access` does not create additional browser workers. Read-only enforcement applies
+to native reader connections; zero-reader mode and WASM use the writer connection.
 
 ## Run
 
@@ -135,7 +158,7 @@ cargo +nightly fmt --check
 | `src/operation.rs` | Typed arguments, SQL, row decoding and shared operation bodies |
 | `src/lib.rs` | Async domain facade |
 | `src/db.rs` | Connection, schema and transaction wrapper |
-| `src/native.rs` | Direct jobs on one owning thread |
+| `src/native.rs` | Access routing, writer and reader threads, shared shutdown |
 | `src/registry.rs` | Typed worker handlers, duplicate and unknown-name checks |
 | `src/browser/` | Worker transport, correlation and lifecycle |
 | `src/web_api.rs`, `web/` | Browser entry points and demo |
@@ -152,16 +175,18 @@ proof-specific operation, not a rule added to the source DAO.
 Accepted operations continue if their waiting future is dropped. Close drains
 accepted work before releasing storage. Termination or a lost reply can leave a
 write's outcome unknown; the client never retries it automatically. Native panics
-stop the connection owner. Errors use a deliberately small serializable type;
-SQLite errors retain their message, not the full `rusqlite::Error` structure.
+stop the affected connection owner; there is no automatic replacement. Calls
+selecting that owner fail until the client is reopened. Errors use a deliberately
+small serializable type; SQLite errors retain their message, not the full
+`rusqlite::Error` structure.
 
 The browser tests run real Chromium and OPFS. A test-only server gate holds a
 SQLite UDF while the separate Rust caller answers a ping, proving worker
 isolation without relying on an arbitrary query duration. Diagnostic operations
 are part of this playground's catalog, not a proposed production API.
 
-This proof uses one connection per executor and unbounded queues. It does not
-implement reader pools, subscriptions, schema upgrades, key allocation, durable
+This proof uses unbounded queues and one browser database connection. It does not
+implement subscriptions, schema upgrades, key allocation, durable
 ownership coordination or multi-tab database sharing. Operations are trusted Rust
 code and must complete their transactions through `Db::write`. A hung worker has
 no transport deadline; callers may explicitly terminate it. Persistent browser

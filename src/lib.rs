@@ -20,7 +20,7 @@ pub use db::Db;
 pub use error::Error;
 pub use model::{PurseId, PurseRecord, PurseTag};
 pub use operation::{
-    CreatePurse, CreatePurses, HeldQuery, Operation, PursesTagged, ReadPurse, SqlFailure,
+    Access, CreatePurse, CreatePurses, HeldQuery, Operation, PursesTagged, ReadPurse, SqlFailure,
 };
 
 #[cfg(target_arch = "wasm32")]
@@ -35,11 +35,29 @@ pub struct Client {
 }
 
 impl Client {
-    /// Opens a native database on its dedicated thread.
+    /// Opens a native writer and two readers; private temporary databases use only the writer.
     #[cfg(not(target_arch = "wasm32"))]
     pub async fn open(path: impl AsRef<std::path::Path>) -> Result<Self, Error> {
+        let path = path.as_ref();
+        let readers = if path == std::path::Path::new(":memory:") || path.as_os_str().is_empty() {
+            0
+        } else {
+            2
+        };
+        Self::open_with_readers(path, readers).await
+    }
+
+    /// Opens one native writer and the requested number of read-only connections.
+    ///
+    /// Zero readers routes all work to the writer. Multiple connections require
+    /// a file-backed WAL database; private memory and temporary databases are rejected.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn open_with_readers(
+        path: impl AsRef<std::path::Path>,
+        readers: usize,
+    ) -> Result<Self, Error> {
         Ok(Self {
-            backend: Backend::open(path).await?,
+            backend: Backend::open(path, readers).await?,
         })
     }
 

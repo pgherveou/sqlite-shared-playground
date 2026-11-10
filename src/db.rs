@@ -15,6 +15,16 @@ impl Db {
         Self::initialize(Connection::open(path)?)
     }
 
+    /// Opens a native reader after the writer has initialized the schema.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn open_reader(path: impl AsRef<Path>) -> Result<Self, Error> {
+        let connection = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        Ok(Self { connection })
+    }
+
     /// Opens an isolated database for tests.
     pub fn memory() -> Result<Self, Error> {
         Self::initialize(Connection::open_in_memory()?)
