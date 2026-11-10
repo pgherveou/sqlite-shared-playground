@@ -3,6 +3,8 @@
 The same Rust purse operations run on native connection threads
 and in a dedicated browser database worker. There is no `async-sqlite` dependency.
 This is an execution-model proof, not a drop-in replacement for that crate.
+The native demo and async tests use Tokio 1, matching host-rust-core. SQLite runs
+on its dedicated connection threads; browser tasks use `wasm-bindgen-futures`.
 
 ```text
 Native Rust CLI                 Browser page
