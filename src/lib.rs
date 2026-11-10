@@ -1,6 +1,5 @@
 //! Shared purse operations executed on a native thread or a dedicated WASM worker.
 
-mod dao;
 mod db;
 mod error;
 mod model;

@@ -1,6 +1,6 @@
 # Shared SQLite playground
 
-The same Rust purse DAO and operation handlers run on a native connection thread
+The same Rust purse operations run on a native connection thread
 and in a dedicated browser database worker. There is no `async-sqlite` dependency.
 This is an execution-model proof, not a drop-in replacement for that crate.
 
@@ -16,7 +16,7 @@ Connection thread               Database worker, separate WASM instance
       |                              | Registry
       +--------- Operation::execute(&mut Db)
                               |
-                     DAO / rusqlite / SQLite
+                       rusqlite / SQLite
 ```
 
 ## How it differs from async-sqlite
@@ -67,7 +67,13 @@ impl Operation for ReadPurse {
     type Output = Option<PurseRecord>;
 
     fn execute(self, db: &mut Db) -> Result<Self::Output, Error> {
-        db.read(|conn| dao::purse(conn, self.id))
+        db.read(|conn| {
+            let mut statement = conn
+                .prepare_cached("SELECT id, name, tag FROM nft_purse WHERE id = :id")?;
+            Ok(statement
+                .query_row(named_params! { ":id": self.id.0 }, purse_record)
+                .optional()?)
+        })
     }
 }
 ```
@@ -93,7 +99,7 @@ identical. There is no native registry lookup or serialization requirement.
 | SQLite access | Ordinary `rusqlite` inside the closure | Ordinary `rusqlite` inside the handler |
 | Application work | Write the closure at the call site | Declare an operation and register it for browser use |
 
-A handler can use cached statements, map rows, and compose several DAO functions
+A handler can use cached statements, map rows, and compose several queries
 inside one `Db::write` transaction. Transactions finish before the handler replies;
 there is no message per SQL statement or remote transaction handle. Application
 services captured by existing closures still need an explicit design if the
@@ -126,8 +132,7 @@ cargo +nightly fmt --check
 
 | File | Responsibility |
 | --- | --- |
-| `src/dao.rs` | Purse SQL, cached statements and row decoding |
-| `src/operation.rs` | Typed arguments and shared operation bodies |
+| `src/operation.rs` | Typed arguments, SQL, row decoding and shared operation bodies |
 | `src/lib.rs` | Async domain facade |
 | `src/db.rs` | Connection, schema and transaction wrapper |
 | `src/native.rs` | Direct jobs on one owning thread |
@@ -135,7 +140,7 @@ cargo +nightly fmt --check
 | `src/browser/` | Worker transport, correlation and lifecycle |
 | `src/web_api.rs`, `web/` | Browser entry points and demo |
 
-The purse DAO, schema and domain types are adapted from `host-rust-core` at
+The purse queries, schema and domain types are adapted from `host-rust-core` at
 `4b58ce1db4c01e937ebbb1e00c40833b99e5bfe5`, specifically `nft/dao.rs`,
 `nft/purse.rs` and `store/migration/v2_to_v3_nft_purses.rs`. SQL and row decoding
 are retained. Standalone imports/errors and serialization derives replace host

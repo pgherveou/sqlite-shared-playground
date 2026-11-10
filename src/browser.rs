@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! Caller WASM                 Database worker WASM
-//! Backend -- arguments --> Registry --> Db --> DAO
+//! Backend -- arguments --> Registry --> Db --> SQLite
 //!         <-- result -----
 //! ```
 

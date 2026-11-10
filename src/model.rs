@@ -13,7 +13,7 @@ impl PurseId {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PurseTag(pub Vec<u8>);
 
-/// A purse returned by the shared DAO.
+/// A purse returned by the shared operations.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PurseRecord {
     /// Stable database identifier.

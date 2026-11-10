@@ -1,6 +1,7 @@
+use rusqlite::{OptionalExtension, Row, Transaction, named_params};
 use serde::{Deserialize, Serialize};
 
-use crate::{Db, Error, PurseId, PurseRecord, PurseTag, dao};
+use crate::{Db, Error, PurseId, PurseRecord, PurseTag};
 
 /// A complete synchronous database operation, with a stable wire identity.
 pub trait Operation {
@@ -24,7 +25,13 @@ impl Operation for ReadPurse {
     type Output = Option<PurseRecord>;
 
     fn execute(self, db: &mut Db) -> Result<Self::Output, Error> {
-        db.read(|connection| dao::purse(connection, self.id))
+        db.read(|connection| {
+            let mut statement =
+                connection.prepare_cached("SELECT id, name, tag FROM nft_purse WHERE id = :id")?;
+            Ok(statement
+                .query_row(named_params! { ":id": self.id.0 }, purse_record)
+                .optional()?)
+        })
     }
 }
 
@@ -42,7 +49,7 @@ impl Operation for CreatePurse {
     type Output = Option<PurseId>;
 
     fn execute(self, db: &mut Db) -> Result<Self::Output, Error> {
-        db.write(|transaction| dao::insert_purse(transaction, &self.name, &self.tag))
+        db.write(|transaction| insert_purse(transaction, &self.name, &self.tag))
     }
 }
 
@@ -58,7 +65,13 @@ impl Operation for PursesTagged {
     type Output = Vec<PurseRecord>;
 
     fn execute(self, db: &mut Db) -> Result<Self::Output, Error> {
-        db.read(|connection| dao::purses_tagged(connection, &self.tag))
+        db.read(|connection| {
+            let mut statement = connection.prepare_cached(
+                "SELECT id, name, tag FROM nft_purse WHERE tag = :tag ORDER BY id",
+            )?;
+            let rows = statement.query_map(named_params! { ":tag": self.tag.0 }, purse_record)?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })
     }
 }
 
@@ -83,12 +96,37 @@ impl Operation for CreatePurses {
                     if name.is_empty() {
                         return Err(Error::Refused("purse name must not be empty".into()));
                     }
-                    dao::insert_purse(transaction, &name, &self.tag)?
+                    insert_purse(transaction, &name, &self.tag)?
                         .ok_or_else(|| Error::Refused("purse identifiers exhausted".into()))
                 })
                 .collect()
         })
     }
+}
+
+fn insert_purse(
+    transaction: &Transaction<'_>,
+    name: &str,
+    tag: &PurseTag,
+) -> Result<Option<PurseId>, Error> {
+    let next: u32 = transaction
+        .prepare_cached("SELECT COALESCE(MAX(id) + 1, 0) FROM nft_purse WHERE id < :main")?
+        .query_row(named_params! { ":main": PurseId::MAIN.0 }, |row| row.get(0))?;
+    if next == PurseId::MAIN.0 {
+        return Ok(None);
+    }
+    transaction
+        .prepare_cached("INSERT INTO nft_purse (id, name, tag) VALUES (:id, :name, :tag)")?
+        .execute(named_params! { ":id": next, ":name": name, ":tag": tag.0 })?;
+    Ok(Some(PurseId(next)))
+}
+
+fn purse_record(row: &Row<'_>) -> rusqlite::Result<PurseRecord> {
+    Ok(PurseRecord {
+        id: PurseId(row.get("id")?),
+        name: row.get("name")?,
+        tag: PurseTag(row.get("tag")?),
+    })
 }
 
 /// Exercises an SQL failure without invalidating subsequent operations.
