@@ -1,43 +1,21 @@
 # Shared SQLite playground
 
-The same Rust purse operations run on native connection threads
-and in a dedicated browser database worker. There is no `async-sqlite` dependency.
-This is an execution-model proof, not a drop-in replacement for that crate.
-The native demo and async tests use Tokio 1, matching host-rust-core. SQLite runs
-on its dedicated connection threads; browser tasks use `wasm-bindgen-futures`.
-Worker requests, results and errors use SCALE (`parity-scale-codec` 3).
+The same Rust database operations run on native connection threads and in a
+separate browser database worker. This playground uses purse queries adapted
+from `host-rust-core` to demonstrate both paths. It has no `async-sqlite`
+dependency and is not a drop-in replacement for that crate.
 
-```text
-Native Rust CLI                 Browser page
-      |                              |
-      |                        Rust/WASM caller worker
-      |                              |
-  PurseDao                       PurseDao
-      |                              |
-   Client                         Client
-      | typed job                    | encoded operation
-      v                              v
-Writer + reader threads         Database worker, separate WASM instance
-      |                              | Registry
-      +--------- Operation::execute(&mut Db)
-                              |
-                       rusqlite / SQLite
-```
+## How async-sqlite works
 
-## How it differs from async-sqlite
+[`async-sqlite`](https://github.com/ryanfowler/async-sqlite) owns each SQLite
+connection on a native thread. The caller sends a Rust closure to that thread
+and awaits its result. The closure can capture application values and use
+ordinary `rusqlite` queries and transactions.
 
-[`async-sqlite`](https://github.com/ryanfowler/async-sqlite) sends a Rust closure
-to a connection-owning native thread. The closure can use ordinary `rusqlite`
-queries, transactions and captured application values. The following read assumes
-an existing purse table and a numeric `id: u32`:
+For an opened client, an existing purse table and an `id: u32`:
 
 ```rust
 use rusqlite::OptionalExtension;
-
-let sqlite = async_sqlite::ClientBuilder::new()
-    .path("purses.sqlite3")
-    .open()
-    .await?;
 
 let name: Option<String> = sqlite.conn(move |conn| {
     conn.query_row(
@@ -48,105 +26,87 @@ let name: Option<String> = sqlite.conn(move |conn| {
 }).await?;
 ```
 
-Native threads share memory, so they can receive that closure. A separate browser
-worker has its own WASM instance and cannot receive arbitrary captured Rust
-closures. Making the call `async` does not remove this boundary.
+This executor relies on native threads and shared process memory. In a browser,
+`std::thread::spawn` does not create a Web Worker. A separate worker has its own
+WASM instance and cannot receive an arbitrary Rust closure and its captures.
+Making the call `async` does not bridge that boundary.
 
-Here, the caller uses the public DAO with the same `id`:
+## Shared native and WASM architecture
+
+The caller submits a typed, named operation. Its Rust implementation lives beside
+SQLite and can execute several queries within one transaction.
+
+```text
+Native application                 Browser UI
+        |                               |
+        |                         Rust/WASM caller worker
+        |                               |
+     PurseDao                        PurseDao
+        |                               |
+      Client                          Client
+        | Rust value                    | operation name + SCALE arguments
+        v                               v
+Writer + reader threads            Dedicated DB worker, separate WASM instance
+        |                               | registered handler
+        v                               v
+ Operation::execute                 Operation::execute
+        |                               |
+     SQLite                          SQLite / OPFS
+```
+
+- **Native:** send the operation value to a connection thread and execute it
+  directly. No serialization or operation registry is needed.
+- **WASM:** register the operation handlers when the database worker starts.
+  The caller sends the operation name and arguments encoded with SCALE
+  (`parity-scale-codec`). The worker looks up the handler, decodes the arguments,
+  runs the operation and sends back a SCALE-encoded result or error. Only data
+  crosses the boundary; the handler code is already compiled into the worker.
+
+Both paths expose the same domain API. Given a connected `client` and `id: u32`:
 
 ```rust
-use sqlite_shared_playground::{Client, PurseDao, PurseId, initialize_database};
+use sqlite_shared_playground::{PurseDao, PurseId};
 
-let client = Client::open("purses.sqlite3", initialize_database).await?; // native
 let purses = PurseDao::new(client.clone());
 let name = purses.get(PurseId(id)).await?.map(|purse| purse.name);
-client.close().await?;
 ```
 
-Inside [purse.rs](src/purse.rs), the operation uses the module's imports and
-`purse_record` row mapper:
+[purse.rs](src/purse.rs) holds the DAO, domain types, operation implementations,
+SQL and registration. [startup.rs](src/startup.rs) composes domain initialization
+and registers the purse handlers with `purse::register(&mut registry)?`.
+The client and executors remain independent of the domain.
 
-```rust
-#[derive(Encode, Decode)]
-pub struct ReadPurse {
-    pub id: PurseId,
-}
+Database work occupies only its connection thread or database worker. The browser
+UI and Rust caller worker remain free to process messages while SQLite runs.
 
-impl Operation for ReadPurse {
-    const NAME: &'static str = "nft.purse.v1";
-    const ACCESS: Access = Access::Read;
-    type Output = Option<PurseRecord>;
+## Contracts and limits
 
-    fn execute(self, db: &mut Db) -> Result<Self::Output, Error> {
-        db.read(|conn| {
-            let mut statement = conn
-                .prepare_cached("SELECT id, name, tag FROM nft_purse WHERE id = :id")?;
-            Ok(statement
-                .query_row(named_params! { ":id": self.id.0 }, purse_record)
-                .optional()?)
-        })
-    }
-}
-```
-
-`PurseDao::get(id)` calls `Client::call(ReadPurse { id })`. Native dispatch sends
-that value to a reader thread and invokes `execute` directly, without
-serialization. Browser dispatch sends the operation name and encoded arguments;
-the database worker decodes them with SCALE and invokes the same implementation.
-Only the final result crosses back. `purse.rs` owns the DAO methods, types, SQL,
-schema and operation registration. Inside [startup.rs](src/startup.rs), the worker
-catalog includes the domain through:
-
-```rust
-purse::register(&mut registry)?;
-```
-
-On WASM, use `Client::connect(worker).await?`, then construct `PurseDao` the same
-way. The database worker calls `serve_database(name)` to register operations and
-initialize its schema before reporting readiness. Native startup receives
-`initialize_database` explicitly and needs no registry lookup or serialization.
-Decoders reject trailing bytes. The envelope version and explicit enum indexes
-define the wire format; caller and database worker must use compatible builds.
-
-| | async-sqlite closure API | This playground |
-| --- | --- | --- |
-| Unit of work | Arbitrary Rust closure | Named Rust operation |
-| Native execution | Connection thread, with optional pool | One writer and configurable read-only readers |
-| Browser execution | Closure cannot cross independent WASM instances | Registered handler in a separate database worker |
-| SQLite access | Ordinary `rusqlite` inside the closure | Ordinary `rusqlite` inside the handler |
-| Application work | Write the closure at the call site | Declare an operation and register it for browser use |
-
-A handler can use cached statements, map rows, and compose several queries
-inside one `Db::write` transaction. Transactions finish before the handler replies;
-there is no message per SQL statement or remote transaction handle. Application
-services captured by existing closures still need an explicit design if the
-operation depends on them. This proof covers data-only purse operations.
-
-## Native readers and writer
-
-Operations default to `Access::Write`. `ReadPurse` and `PursesTagged` declare
-`Access::Read`; native dispatch selects a reader round-robin. Each connection has
-its own thread. The writer initializes the schema and enables WAL before readers
-open with SQLite's read-only flag. Operations mixing reads and writes stay on the
-writer for their entire transaction.
-
-```rust
-use sqlite_shared_playground::{Client, initialize_database};
-
-let client = Client::open("purses.sqlite3", initialize_database).await?; // two readers
-client.close().await?;
-// Or choose the reader count; zero routes every operation to the writer.
-let client = Client::open_with_readers("other.sqlite3", 4, initialize_database).await?;
-client.close().await?;
-```
-
-Readers can progress during a write and see committed data. There is no global
-FIFO across connections: await a write before submitting a dependent read. Close
-stops admission to all connections and waits for their queued work. Private memory
-and temporary databases default to one connection and reject explicit readers.
-The browser uses the same operation definitions on its single database worker;
-`Access` does not create additional browser workers. Read-only enforcement applies
-to native reader connections; zero-reader mode and WASM use the writer connection.
+- An operation finishes its transaction before replying. Several queries can
+  run atomically through `Db::write`; there is no remote transaction handle.
+- Native storage uses one writer and configurable read-only readers. Private
+  memory and temporary databases use only the writer. The browser uses one
+  database connection in one dedicated worker.
+- Native readers can progress during a write and see committed data. There is
+  no global ordering across connections; await a write before a dependent read.
+  Read-only enforcement applies to native reader connections, not the browser
+  or native configurations with no readers.
+- Accepted operations survive dropped reply futures. Close stops admission and
+  drains accepted work before releasing storage.
+- Termination or a lost reply can leave a write's outcome unknown. There are no
+  automatic retries. An unwinding native panic stops the affected connection
+  thread; calls selecting it fail until the client is reopened.
+- Caller and database worker must use compatible operation definitions and wire
+  formats. Malformed payloads, trailing bytes and unknown operations are rejected.
+  SQLite errors retain their message, not the full `rusqlite::Error` structure.
+- Operations are trusted Rust code. Queues are unbounded and there is no execution
+  deadline; callers may explicitly terminate a hung browser worker.
+- Application services captured by existing closures cannot automatically move
+  to the database worker. Operations depending on them need an explicit design.
+- Browser persistence requires OPFS support. Initialization errors do not fall
+  back to memory.
+- The proof does not implement subscriptions, schema upgrades, key allocation,
+  durable ownership coordination or multi-tab database sharing. Diagnostic
+  operations and the batch-refusal rule are demonstration features.
 
 ## Run
 
@@ -159,59 +119,6 @@ npm run build
 npm run dev
 ```
 
-Open <http://127.0.0.1:5191>. The browser demo creates, fetches and lists purses,
-demonstrates refused-batch rollback, and reopens OPFS storage.
-
-```sh
-cargo test --all-targets
-npx playwright install chromium
-npm test                       # after npm run build
-cargo clippy --all-targets -- -D warnings
-cargo clippy --lib --target wasm32-unknown-unknown -- -D warnings
-cargo +nightly fmt --check
-```
-
-## Where to look
-
-| File | Responsibility |
-| --- | --- |
-| `src/purse.rs` | Purse DAO, types, operations, SQL, schema and registration |
-| `src/lib.rs`, `src/operation.rs` | Generic client, operation trait and access routing declaration |
-| `src/startup.rs` | Domain schema and worker catalog composition |
-| `src/db.rs` | Connection and transaction wrapper |
-| `src/native.rs` | Access routing, writer and reader threads, shared shutdown |
-| `src/registry.rs` | Typed worker handlers, duplicate and unknown-name checks |
-| `src/browser/` | Worker transport, correlation and lifecycle |
-| `src/web_api.rs`, `web/` | Browser entry points and demo |
-| `src/proof.rs` | Diagnostic operations and the browser isolation gate |
-
-The purse queries, schema and domain types are adapted from `host-rust-core` at
-`4b58ce1db4c01e937ebbb1e00c40833b99e5bfe5`, specifically `nft/dao.rs`,
-`nft/purse.rs` and `store/migration/v2_to_v3_nft_purses.rs`. SQL and row decoding
-are retained. Standalone imports/errors and serialization derives replace host
-dependencies; schema initialization is idempotent. The batch refusal rule is a
-proof-specific operation, not a rule added to the source DAO.
-
-## Contracts and limits
-
-- Accepted operations continue if their waiting future is dropped. Close drains
-  accepted work before releasing storage.
-- Termination or a lost reply can leave a write's outcome unknown; the client
-  never retries it automatically.
-- An unwinding native panic exits the affected connection thread naturally and
-  closes pending reply channels. There is no panic interception or automatic
-  replacement; calls selecting that owner fail until the client is reopened.
-- Errors use a small serializable type. SQLite errors retain their message,
-  not the full `rusqlite::Error` structure.
-- Browser tests run real Chromium and OPFS. A test-only server gate holds a
-  SQLite UDF while the separate Rust caller answers a ping, proving isolation
-  without an arbitrary query duration. Diagnostic operations belong to this
-  playground's catalog, not a proposed production API.
-- The proof uses unbounded queues and one browser database connection. It does
-  not implement subscriptions, schema upgrades, key allocation, durable ownership
-  coordination or multi-tab database sharing.
-- Operations are trusted Rust code and must complete their transactions through
-  `Db::write`. A hung worker has no transport deadline; callers may explicitly
-  terminate it.
-- Persistent browser storage requires OPFS support. Initialization errors do not
-  fall back to memory.
+Open <http://127.0.0.1:5191>. Run native tests with `cargo test --all-targets`.
+After building WASM and installing Chromium (`npx playwright install chromium`),
+run `npm test` for the browser tests, including worker isolation and OPFS persistence.
