@@ -29,7 +29,7 @@ Writer + reader threads         Database worker, separate WASM instance
 [`async-sqlite`](https://github.com/ryanfowler/async-sqlite) sends a Rust closure
 to a connection-owning native thread. The closure can use ordinary `rusqlite`
 queries, transactions and captured application values. The following read assumes
-an existing purse table:
+an existing purse table and a numeric `id: u32`:
 
 ```rust
 use rusqlite::OptionalExtension;
@@ -52,15 +52,19 @@ Native threads share memory, so they can receive that closure. A separate browse
 worker has its own WASM instance and cannot receive arbitrary captured Rust
 closures. Making the call `async` does not remove this boundary.
 
-Here, the caller invokes a named operation through a typed facade:
+Here, the caller uses the public DAO with the same `id`:
 
 ```rust
+use sqlite_shared_playground::{Client, PurseDao, PurseId, initialize_database};
+
 let client = Client::open("purses.sqlite3", initialize_database).await?; // native
 let purses = PurseDao::new(client.clone());
 let name = purses.get(PurseId(id)).await?.map(|purse| purse.name);
+client.close().await?;
 ```
 
-The operation's arguments and implementation are declared once:
+Inside [purse.rs](src/purse.rs), the operation uses the module's imports and
+`purse_record` row mapper:
 
 ```rust
 #[derive(Encode, Decode)]
@@ -90,15 +94,17 @@ that value to a reader thread and invokes `execute` directly, without
 serialization. Browser dispatch sends the operation name and encoded arguments;
 the database worker decodes them with SCALE and invokes the same implementation.
 Only the final result crosses back. `purse.rs` owns the DAO methods, types, SQL,
-schema and operation registration. `startup.rs` composes domain initialization and
-the worker catalog:
+schema and operation registration. Inside [startup.rs](src/startup.rs), the worker
+catalog includes the domain through:
 
 ```rust
 purse::register(&mut registry)?;
 ```
 
-On WASM, construction is `Client::connect(worker).await`; the domain methods are
-identical. There is no native registry lookup or serialization requirement.
+On WASM, use `Client::connect(worker).await?`, then construct `PurseDao` the same
+way. The database worker calls `serve_database(name)` to register operations and
+initialize its schema before reporting readiness. Native startup receives
+`initialize_database` explicitly and needs no registry lookup or serialization.
 Decoders reject trailing bytes. The envelope version and explicit enum indexes
 define the wire format; caller and database worker must use compatible builds.
 
@@ -125,9 +131,13 @@ open with SQLite's read-only flag. Operations mixing reads and writes stay on th
 writer for their entire transaction.
 
 ```rust
+use sqlite_shared_playground::{Client, initialize_database};
+
 let client = Client::open("purses.sqlite3", initialize_database).await?; // two readers
+client.close().await?;
 // Or choose the reader count; zero routes every operation to the writer.
 let client = Client::open_with_readers("other.sqlite3", 4, initialize_database).await?;
+client.close().await?;
 ```
 
 Readers can progress during a write and see committed data. There is no global
@@ -184,23 +194,24 @@ proof-specific operation, not a rule added to the source DAO.
 
 ## Contracts and limits
 
-Accepted operations continue if their waiting future is dropped. Close drains
-accepted work before releasing storage. Termination or a lost reply can leave a
-write's outcome unknown; the client never retries it automatically. An unwinding
-native panic exits the affected connection thread naturally and closes pending
-reply channels; there is no panic interception or automatic replacement. Calls
-selecting that owner fail until the client is reopened. Errors use a deliberately
-small serializable type; SQLite errors retain their message, not the full
-`rusqlite::Error` structure.
-
-The browser tests run real Chromium and OPFS. A test-only server gate holds a
-SQLite UDF while the separate Rust caller answers a ping, proving worker
-isolation without relying on an arbitrary query duration. Diagnostic operations
-are part of this playground's catalog, not a proposed production API.
-
-This proof uses unbounded queues and one browser database connection. It does not
-implement subscriptions, schema upgrades, key allocation, durable
-ownership coordination or multi-tab database sharing. Operations are trusted Rust
-code and must complete their transactions through `Db::write`. A hung worker has
-no transport deadline; callers may explicitly terminate it. Persistent browser
-storage requires OPFS support; initialization errors do not fall back to memory.
+- Accepted operations continue if their waiting future is dropped. Close drains
+  accepted work before releasing storage.
+- Termination or a lost reply can leave a write's outcome unknown; the client
+  never retries it automatically.
+- An unwinding native panic exits the affected connection thread naturally and
+  closes pending reply channels. There is no panic interception or automatic
+  replacement; calls selecting that owner fail until the client is reopened.
+- Errors use a small serializable type. SQLite errors retain their message,
+  not the full `rusqlite::Error` structure.
+- Browser tests run real Chromium and OPFS. A test-only server gate holds a
+  SQLite UDF while the separate Rust caller answers a ping, proving isolation
+  without an arbitrary query duration. Diagnostic operations belong to this
+  playground's catalog, not a proposed production API.
+- The proof uses unbounded queues and one browser database connection. It does
+  not implement subscriptions, schema upgrades, key allocation, durable ownership
+  coordination or multi-tab database sharing.
+- Operations are trusted Rust code and must complete their transactions through
+  `Db::write`. A hung worker has no transport deadline; callers may explicitly
+  terminate it.
+- Persistent browser storage requires OPFS support. Initialization errors do not
+  fall back to memory.
