@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Shared SQLite purse playground</title>
+<style>
+  body { font: 16px system-ui, sans-serif; max-width: 760px; margin: 3rem auto; padding: 0 1rem; color: #162638; background: #f6f8fb; }
+  h1 { font-size: 2rem; } code, pre { font-family: ui-monospace, monospace; }
+  form, .actions { display: flex; gap: .6rem; margin: 1rem 0; flex-wrap: wrap; }
+  input, button { font: inherit; padding: .6rem; } button { cursor: pointer; }
+  pre { padding: 1rem; background: white; border: 1px solid #ccd6e0; overflow: auto; }
+  #status { min-height: 1.5rem; } li { margin: .5rem 0; }
+</style>
+<h1>Shared SQLite purses</h1>
+<p>The same Rust DAO runs on a native connection thread and in a separate browser database worker.</p>
+<pre>Page → Rust/WASM caller worker → Rust/WASM database worker → OPFS</pre>
+<p id="status" role="status">Starting workers…</p>
+<form id="create">
+  <label>Purse name <input id="name" required value="Savings"></label>
+  <button>Create purse</button>
+</form>
+<div class="actions">
+  <button id="refresh">Refresh</button>
+  <button id="reopen">Close and reopen storage</button>
+  <button id="rollback">Try a refused batch</button>
+</div>
+<ul id="purses"></ul>
+<pre id="details">Select a purse to read it by ID.</pre>
+<script type="module" src="/main.js"></script>
+</html>
