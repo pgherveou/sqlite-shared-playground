@@ -81,32 +81,28 @@ UI and Rust caller worker remain free to process messages while SQLite runs.
 
 ## Contracts and limits
 
-- An operation finishes its transaction before replying. Several queries can
-  run atomically through `Db::write`; there is no remote transaction handle.
-- Native storage uses one writer and configurable read-only readers. Private
-  memory and temporary databases use only the writer. The browser uses one
-  database connection in one dedicated worker.
-- Native readers can progress during a write and see committed data. There is
-  no global ordering across connections; await a write before a dependent read.
-  Read-only enforcement applies to native reader connections, not the browser
-  or native configurations with no readers.
-- Accepted operations survive dropped reply futures. Close stops admission and
-  drains accepted work before releasing storage.
-- Termination or a lost reply can leave a write's outcome unknown. There are no
-  automatic retries. An unwinding native panic stops the affected connection
-  thread; calls selecting it fail until the client is reopened.
-- Caller and database worker must use compatible operation definitions and wire
-  formats. Malformed payloads, trailing bytes and unknown operations are rejected.
-  SQLite errors retain their message, not the full `rusqlite::Error` structure.
-- Operations are trusted Rust code. Queues are unbounded and there is no execution
-  deadline; callers may explicitly terminate a hung browser worker.
-- Application services captured by existing closures cannot automatically move
-  to the database worker. Operations depending on them need an explicit design.
-- Browser persistence requires OPFS support. Initialization errors do not fall
-  back to memory.
-- The proof does not implement subscriptions, schema upgrades, key allocation,
-  durable ownership coordination or multi-tab database sharing. Diagnostic
-  operations and the batch-refusal rule are demonstration features.
+### Trade-offs versus async-sqlite
+
+- Database work needs named operations and worker registration instead of inline
+  closures. Handlers still use ordinary `rusqlite`, including cached statements
+  and multi-query transactions that finish before replying.
+- Native pooling uses one writer and read-only readers. There is no global
+  ordering across connections; await a write before a dependent read.
+- Errors retain SQLite messages, not the full `rusqlite::Error` structure.
+- Lifecycle behavior differs: accepted work survives dropped reply futures, close
+  drains it, and an unwinding native panic stops that connection until reopening.
+
+### Browser limitations
+
+- Requests and results must cross as SCALE-encoded data. Captured Rust services
+  cannot travel with them; caller and worker need compatible operation definitions.
+- This proof uses one database connection. A long operation delays other database
+  work, while the UI and caller worker remain responsive. Queues are unbounded
+  and there is no execution deadline.
+- Persistence requires OPFS support, with no fallback to memory. Coordinating
+  database access across multiple tabs is not implemented.
+- Terminating the worker or losing a reply can leave a write's outcome unknown.
+  There are no automatic retries.
 
 ## Run
 
